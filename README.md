@@ -35,13 +35,18 @@ at the same time:
 /dev/videoN    "Cam Link Pro HDMI 1" .. "HDMI 4"
 4K inputs      NV12 (the card's own choice; no YUYV/BGR24 option)
 1080p inputs   YUYV
+ALSA           card "Cam Link Pro", PCM devices 0-3 = HDMI 1-4,
+               48 kHz stereo S16_LE (e.g. arecord -D hw:CARD=Pro,DEV=2)
 ```
+
+The capture session runs while any video node or PCM is open (plus 2 s,
+so device probes don't restart it); audio works without a video client.
 
 The format follows whatever the source sends; a change while streaming
 raises `V4L2_EVENT_SOURCE_CHANGE`. Module parameters: `fourport_ring_chunks`
 (DMA ring size, default 64 × ~1 MiB) and `fourport_status_ms` (input poll
-interval). Not yet supported on this card: audio, HDR/colour metadata, EDID
-selection, the `sc0710-cli` controls. Tested with 3× 2160p30 + 1× 1080p60
+interval). Not yet supported on this card: HDR/colour metadata, EDID selection, the
+`sc0710-cli` controls. Tested with 3× 2160p30 + 1× 1080p60
 simultaneously at full frame rate.
 
 ## Kernel compatibility
@@ -364,7 +369,7 @@ For GitHub issues, attach output from `sc0710-cli --dump`.
 
 ## Known limitations / roadmap
 
-* **Cam Link Pro** — no audio yet; formats other than 2160p30 / 1080p60 untested
+* **Cam Link Pro** — formats other than 2160p30 / 1080p60 untested; ECP5 cold-boot upload of its odd-sized bitstream untested on hardware
 * **4K60 DMA tearing** — horizontal tears or frame shifts at 4K60 (~995 MB/s) under heavy load; **under active investigation**
 * **10-bit planar formats** — P010/P016 not implemented; HDR passthrough uses native **BGR24** 4:4:4 instead
 

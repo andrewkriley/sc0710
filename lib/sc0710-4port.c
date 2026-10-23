@@ -12,18 +12,20 @@
  *    flags 00 4f = NV12 luma line (1..H), 00 6f = NV12 chroma line (odd
  *    line numbers 1..H-1), 80 07 = packed YUY2 line (1..H). The vendor
  *    driver sends 4K as NV12 and 1080p as YUY2.
- *  - C2H channel 1 carries audio; it is run (and discarded) like the vendor
- *    driver does, so the FPGA never backs up on it.
+ *  - C2H channel 1 carries audio for all four inputs: 16-byte frames of
+ *    4 x (L, R) S16_LE, 480 frames (10 ms at 48 kHz) per 7680-byte block.
  *  - Each input's timing is an MCU status block at I2C 0x32, sub-address
  *    0x04 + 0x3c * port: vtotal, htotal, vactive, hactive (u16le), fps.
  *  - Nothing interrupts: the vendor driver polls the completed-descriptor
  *    count, and so does this file.
  *
- *  One V4L2 capture node per input; frames are demultiplexed into vmalloc
- *  vb2 buffers by the line headers.
+ *  One V4L2 capture node and one ALSA capture PCM per input; video is
+ *  demultiplexed into vmalloc vb2 buffers by the line headers, audio by
+ *  frame slot.
  */
 
 #include <linux/vmalloc.h>
+#include <linux/debugfs.h>
 #include "sc0710.h"
 
 #define FP_PORTS        4
@@ -110,6 +112,12 @@ struct fp_port {
 	u32               sequence;
 	bool              streaming;
 	u64               frames, dropped;
+
+	/* ALSA capture: asub is the running substream (NULL when stopped),
+	 * apos/aperiod its buffer and period positions, all under alock. */
+	spinlock_t                alock;
+	struct snd_pcm_substream *asub;
+	snd_pcm_uframes_t         apos, aperiod;
 };
 
 struct sc0710_4port {
@@ -127,6 +135,13 @@ struct sc0710_4port {
 	dma_addr_t                  adesc_dma;
 	u8                         *abuf;
 	dma_addr_t                  abuf_dma;
+	u32                         adone_seen;
+	u64                         ablocks, aoverruns;
+	unsigned long               session_start;
+	struct snd_card            *card;
+	/* debugfs: raw audio ring */
+	struct dentry              *dbg;
+	struct debugfs_blob_wrapper abuf_blob;
 
 	/* Hardware session, running while any node is open */
 	struct mutex  hw_lock;
@@ -457,6 +472,61 @@ static void fp_service(struct sc0710_4port *fp)
 	}
 }
 
+/* Copy one 10 ms block's slot for this input into its ALSA buffer. */
+static void fp_audio_port(struct fp_port *p, const u8 *blk, u32 frames)
+{
+	struct snd_pcm_substream *sub;
+	struct snd_pcm_runtime *rt;
+	bool elapsed = false;
+	unsigned long flags;
+	u32 f;
+
+	spin_lock_irqsave(&p->alock, flags);
+	sub = p->asub;
+	if (sub) {
+		rt = sub->runtime;
+		for (f = 0; f < frames; f++) {
+			memcpy(rt->dma_area + frames_to_bytes(rt, p->apos),
+			       blk + f * 16 + p->idx * 4, 4);
+			if (++p->apos >= rt->buffer_size)
+				p->apos = 0;
+			if (++p->aperiod >= rt->period_size) {
+				p->aperiod = 0;
+				elapsed = true;
+			}
+		}
+	}
+	spin_unlock_irqrestore(&p->alock, flags);
+
+	/* Outside alock: this takes the stream lock, which trigger holds
+	 * while taking alock. */
+	if (elapsed)
+		snd_pcm_period_elapsed(sub);
+}
+
+static void fp_audio_service(struct sc0710_4port *fp)
+{
+	u32 done = sc_read(fp->dev, 1, FP_C2H_DONE(1));
+	u32 pending = done - fp->adone_seen;
+	int i;
+
+	if (!pending)
+		return;
+	if (pending >= FP_AUDIO_DESCS - 1) {
+		fp->aoverruns++;
+		fp->adone_seen = done;
+		return;
+	}
+	while (fp->adone_seen != done) {
+		const u8 *blk = fp->abuf + (fp->adone_seen % FP_AUDIO_DESCS) * FP_AUDIO_STRIDE;
+
+		for (i = 0; i < FP_PORTS; i++)
+			fp_audio_port(&fp->port[i], blk, FP_AUDIO_CHUNK / 16);
+		fp->adone_seen++;
+		fp->ablocks++;
+	}
+}
+
 static int fp_dma_thread(void *data)
 {
 	struct sc0710_4port *fp = data;
@@ -468,8 +538,10 @@ static int fp_dma_thread(void *data)
 			continue;
 		}
 		mutex_lock(&fp->dma_lock);
-		if (fp->running)
+		if (fp->running) {
 			fp_service(fp);
+			fp_audio_service(fp);
+		}
 		mutex_unlock(&fp->dma_lock);
 		usleep_range(500, 1000);
 	}
@@ -577,6 +649,10 @@ static void fp_hw_start(struct sc0710_4port *fp)
 	fp->locked_once = false;
 	fp->overruns = 0;
 	fp->resyncs = 0;
+	fp->adone_seen = 0;
+	fp->ablocks = 0;
+	fp->aoverruns = 0;
+	fp->session_start = jiffies;
 	mutex_unlock(&fp->dma_lock);
 
 	sc_write(dev, 1, FP_C2H_CTRL_W1S(0), 1);
@@ -604,8 +680,10 @@ static void fp_hw_stop(struct sc0710_4port *fp)
 	sc_clr(dev, 0, BAR0_00D0, 0x0001);
 	sc_write(dev, 1, FP_C2H_CTRL_W1C(0), 1);
 	sc_write(dev, 1, FP_C2H_CTRL_W1C(1), 1);
-	printk(KERN_DEBUG "%s: capture session stopped (overruns %llu, resyncs %llu)\n",
-		dev->name, fp->overruns, fp->resyncs);
+	/* 100 audio blocks per second means the 48 kHz assumption holds */
+	printk(KERN_DEBUG "%s: capture session stopped (overruns %llu, resyncs %llu, audio %llu blocks in %u ms, %llu overruns)\n",
+		dev->name, fp->overruns, fp->resyncs, fp->ablocks,
+		jiffies_to_msecs(jiffies - fp->session_start), fp->aoverruns);
 }
 
 /* The stream runs while any node is open, so formats are known (from the
@@ -929,6 +1007,7 @@ static int fp_port_register(struct sc0710_4port *fp, int idx)
 	p->idx = idx;
 	mutex_init(&p->lock);
 	spin_lock_init(&p->qlock);
+	spin_lock_init(&p->alock);
 	INIT_LIST_HEAD(&p->bufs);
 	fp_port_set_format(p, V4L2_PIX_FMT_YUYV, 1920, 1080, 60);
 
@@ -972,6 +1051,142 @@ static void fp_port_unregister(struct fp_port *p)
 #else
 	video_unregister_device(&p->vdev);
 #endif
+}
+
+/* ----------------------------------------------------------- */
+/* ALSA                                                         */
+
+static const struct snd_pcm_hardware fp_pcm_hw = {
+	.info             = SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_MMAP_VALID |
+			    SNDRV_PCM_INFO_INTERLEAVED | SNDRV_PCM_INFO_BLOCK_TRANSFER,
+	.formats          = SNDRV_PCM_FMTBIT_S16_LE,
+	.rates            = SNDRV_PCM_RATE_48000,
+	.rate_min         = 48000,
+	.rate_max         = 48000,
+	.channels_min     = 2,
+	.channels_max     = 2,
+	.buffer_bytes_max = 256 * 1024,
+	.period_bytes_min = 480 * 4,	/* one 10 ms DMA block */
+	.period_bytes_max = 64 * 1024,
+	.periods_min      = 2,
+	.periods_max      = 64,
+};
+
+static int fp_pcm_open(struct snd_pcm_substream *sub)
+{
+	struct fp_port *p = snd_pcm_substream_chip(sub);
+	int ret;
+
+	ret = fp_hw_get(p->fp);
+	if (ret)
+		return ret;
+	/* An open PCM pins dev (and with it fp) past a remove, like an open
+	 * video node does through the v4l2 core. */
+	v4l2_device_get(&p->fp->dev->v4l2_dev);
+	sub->runtime->hw = fp_pcm_hw;
+	return snd_pcm_hw_constraint_integer(sub->runtime, SNDRV_PCM_HW_PARAM_PERIODS);
+}
+
+static int fp_pcm_close(struct snd_pcm_substream *sub)
+{
+	struct fp_port *p = snd_pcm_substream_chip(sub);
+	struct sc0710_4port *fp = p->fp;
+	struct sc0710_dev *dev = fp->dev;
+
+	/* Wait out a DMA pass that may still signal this substream */
+	mutex_lock(&fp->dma_lock);
+	mutex_unlock(&fp->dma_lock);
+	fp_hw_put(fp);
+	v4l2_device_put(&dev->v4l2_dev);
+	return 0;
+}
+
+static int fp_pcm_prepare(struct snd_pcm_substream *sub)
+{
+	struct fp_port *p = snd_pcm_substream_chip(sub);
+	unsigned long flags;
+
+	spin_lock_irqsave(&p->alock, flags);
+	p->apos = 0;
+	p->aperiod = 0;
+	spin_unlock_irqrestore(&p->alock, flags);
+	return 0;
+}
+
+static int fp_pcm_trigger(struct snd_pcm_substream *sub, int cmd)
+{
+	struct fp_port *p = snd_pcm_substream_chip(sub);
+
+	switch (cmd) {
+	case SNDRV_PCM_TRIGGER_START:
+	case SNDRV_PCM_TRIGGER_RESUME:
+		spin_lock(&p->alock);
+		p->asub = sub;
+		spin_unlock(&p->alock);
+		return 0;
+	case SNDRV_PCM_TRIGGER_STOP:
+	case SNDRV_PCM_TRIGGER_SUSPEND:
+		spin_lock(&p->alock);
+		p->asub = NULL;
+		spin_unlock(&p->alock);
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
+
+static snd_pcm_uframes_t fp_pcm_pointer(struct snd_pcm_substream *sub)
+{
+	struct fp_port *p = snd_pcm_substream_chip(sub);
+
+	return READ_ONCE(p->apos);
+}
+
+static const struct snd_pcm_ops fp_pcm_ops = {
+	.open    = fp_pcm_open,
+	.close   = fp_pcm_close,
+	.prepare = fp_pcm_prepare,
+	.trigger = fp_pcm_trigger,
+	.pointer = fp_pcm_pointer,
+};
+
+/* One card, PCM device n = HDMI n+1 */
+static int fp_audio_register(struct sc0710_4port *fp)
+{
+	struct sc0710_dev *dev = fp->dev;
+	struct snd_card *card;
+	struct snd_pcm *pcm;
+	int i, ret;
+
+	ret = snd_card_new(&dev->pci->dev, SNDRV_DEFAULT_IDX1, SNDRV_DEFAULT_STR1,
+			   THIS_MODULE, 0, &card);
+	if (ret)
+		return ret;
+	strscpy(card->driver, "sc0710", sizeof(card->driver));
+	strscpy(card->shortname, "Cam Link Pro", sizeof(card->shortname));
+	snprintf(card->longname, sizeof(card->longname), "Elgato Cam Link Pro at %s",
+		 pci_name(dev->pci));
+
+	for (i = 0; i < FP_PORTS; i++) {
+		ret = snd_pcm_new(card, "Cam Link Pro", i, 0, 1, &pcm);
+		if (ret)
+			goto fail;
+		pcm->private_data = &fp->port[i];
+		snprintf(pcm->name, sizeof(pcm->name), "Cam Link Pro HDMI %d", i + 1);
+		snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_CAPTURE, &fp_pcm_ops);
+		snd_pcm_set_managed_buffer_all(pcm, SNDRV_DMA_TYPE_VMALLOC, NULL, 0, 0);
+	}
+
+	ret = snd_card_register(card);
+	if (ret)
+		goto fail;
+	fp->card = card;
+	printk(KERN_INFO "%s: audio: ALSA card %d, PCM 0-3 = HDMI 1-4\n", dev->name, card->number);
+	return 0;
+
+fail:
+	snd_card_free(card);
+	return ret;
 }
 
 /* ----------------------------------------------------------- */
@@ -1078,6 +1293,11 @@ int sc0710_4port_probe(struct sc0710_dev *dev)
 
 	fp_ports_enable(dev);
 
+	fp->abuf_blob.data = fp->abuf;
+	fp->abuf_blob.size = FP_AUDIO_DESCS * FP_AUDIO_STRIDE;
+	fp->dbg = debugfs_create_dir(dev->name, NULL);
+	debugfs_create_blob("audio_ring", 0400, fp->dbg, &fp->abuf_blob);
+
 	fp->dma_thread = kthread_run(fp_dma_thread, fp, "sc0710 4port dma");
 	if (IS_ERR(fp->dma_thread)) {
 		ret = PTR_ERR(fp->dma_thread);
@@ -1100,6 +1320,12 @@ int sc0710_4port_probe(struct sc0710_dev *dev)
 			goto fail;
 		}
 	}
+
+	/* Audio is optional, as for the other boards */
+	ret = fp_audio_register(fp);
+	if (ret)
+		printk(KERN_WARNING "%s: audio registration failed (%d), continuing without audio\n",
+			dev->name, ret);
 	return 0;
 
 fail:
@@ -1115,9 +1341,15 @@ void sc0710_4port_remove(struct sc0710_dev *dev)
 	if (!fp)
 		return;
 
-	/* Nodes first: stops any streaming queue and refuses new opens */
+	/* Nodes first: stops any streaming queue and refuses new opens.
+	 * Open PCMs hold their own dev reference and see the disconnect. */
 	for (i = 0; i < FP_PORTS; i++)
 		fp_port_unregister(&fp->port[i]);
+	if (fp->card) {
+		snd_card_disconnect(fp->card);
+		snd_card_free_when_closed(fp->card);
+		fp->card = NULL;
+	}
 
 	if (fp->status_thread)
 		kthread_stop(fp->status_thread);
@@ -1135,6 +1367,9 @@ void sc0710_4port_remove(struct sc0710_dev *dev)
 	if (fp->dma_thread)
 		kthread_stop(fp->dma_thread);
 	fp->dma_thread = NULL;
+
+	debugfs_remove_recursive(fp->dbg);
+	fp->dbg = NULL;
 
 	fp_free_rings(fp);
 }
