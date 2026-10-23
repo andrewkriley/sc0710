@@ -26,6 +26,7 @@
 
 #include <linux/vmalloc.h>
 #include <linux/debugfs.h>
+#include <media/v4l2-dv-timings.h>
 #include "sc0710.h"
 
 #define FP_PORTS        4
@@ -592,9 +593,15 @@ static int fp_status_thread(void *data)
 			if (fp_read_status(fp, i, &st) < 0)
 				continue;
 			locked = st.hactive && st.vactive;
+			/* The rate is measured after lock, so it can read 0 at first:
+			 * log mode changes on a locked input as well as lock edges. */
 			if (locked != p->locked)
 				printk(KERN_INFO "%s: HDMI %d %s %ux%u@%u\n", dev->name, i + 1,
 					locked ? "signal" : "no signal", st.hactive, st.vactive, st.fps);
+			else if (locked && (st.hactive != p->st.hactive ||
+					    st.vactive != p->st.vactive || st.fps != p->st.fps))
+				printk(KERN_INFO "%s: HDMI %d mode %ux%u@%u\n", dev->name, i + 1,
+					st.hactive, st.vactive, st.fps);
 			p->st = st;
 			p->locked = locked;
 			fp_port_update_format(p);
@@ -938,6 +945,7 @@ static int fp_enum_input(struct file *file, void *priv, struct v4l2_input *i)
 	if (i->index)
 		return -EINVAL;
 	i->type = V4L2_INPUT_TYPE_CAMERA;
+	i->capabilities = V4L2_IN_CAP_DV_TIMINGS;
 	snprintf(i->name, sizeof(i->name), "HDMI %d", p->idx + 1);
 	i->status = p->locked ? 0 : V4L2_IN_ST_NO_SIGNAL;
 	return 0;
@@ -952,6 +960,98 @@ static int fp_g_input(struct file *file, void *priv, unsigned int *i)
 static int fp_s_input(struct file *file, void *priv, unsigned int i)
 {
 	return i ? -EINVAL : 0;
+}
+
+/* What a line can carry bounds the modes; the MCU reports only totals,
+ * actives and an integer rate, so only progressive modes are known. */
+static const struct v4l2_dv_timings_cap fp_dv_cap = {
+	.type = V4L2_DV_BT_656_1120,
+	.bt = {
+		.min_width = 640,
+		.max_width = 3840,
+		.min_height = 480,
+		.max_height = 2160,
+		.min_pixelclock = 25000000,
+		.max_pixelclock = 600000000,
+		.standards = V4L2_DV_BT_STD_CEA861 | V4L2_DV_BT_STD_DMT |
+			     V4L2_DV_BT_STD_CVT | V4L2_DV_BT_STD_GTF,
+		.capabilities = V4L2_DV_BT_CAP_PROGRESSIVE,
+	},
+};
+
+/* Timings of the input: the standard mode with the same raster and rate
+ * if there is one, else the raster with all blanking in the back porch
+ * (the MCU doesn't report sync widths or polarities). */
+static int fp_port_timings(struct fp_port *p, struct v4l2_dv_timings *t)
+{
+	struct fp_status st = p->st;
+	struct v4l2_bt_timings *bt = &t->bt;
+	int i;
+
+	if (!p->locked)
+		return -ENOLINK;
+	if (!st.fps || st.htotal < st.hactive || st.vtotal < st.vactive)
+		return -ENOLCK;
+
+	for (i = 0; v4l2_dv_timings_presets[i].bt.width; i++) {
+		const struct v4l2_bt_timings *pb = &v4l2_dv_timings_presets[i].bt;
+		u32 htot = V4L2_DV_BT_FRAME_WIDTH(pb), vtot = V4L2_DV_BT_FRAME_HEIGHT(pb);
+
+		if (pb->interlaced || pb->width != st.hactive || pb->height != st.vactive ||
+		    htot != st.htotal || vtot != st.vtotal ||
+		    DIV_ROUND_CLOSEST_ULL(pb->pixelclock, (u64)htot * vtot) != st.fps)
+			continue;
+		*t = v4l2_dv_timings_presets[i];
+		return 0;
+	}
+
+	memset(t, 0, sizeof(*t));
+	t->type = V4L2_DV_BT_656_1120;
+	bt->width = st.hactive;
+	bt->height = st.vactive;
+	bt->hbackporch = st.htotal - st.hactive;
+	bt->vbackporch = st.vtotal - st.vactive;
+	bt->pixelclock = (u64)st.htotal * st.vtotal * st.fps;
+	return 0;
+}
+
+static int fp_query_dv_timings(struct file *file, void *priv, struct v4l2_dv_timings *t)
+{
+	return fp_port_timings(video_drvdata(file), t);
+}
+
+/* The format follows the input by itself, so the current timings are
+ * the detected ones and the only ones that can be set. */
+static int fp_g_dv_timings(struct file *file, void *priv, struct v4l2_dv_timings *t)
+{
+	return fp_port_timings(video_drvdata(file), t) ? -ENODATA : 0;
+}
+
+static int fp_s_dv_timings(struct file *file, void *priv, struct v4l2_dv_timings *t)
+{
+	struct v4l2_dv_timings cur;
+
+	if (fp_port_timings(video_drvdata(file), &cur) ||
+	    !v4l2_match_dv_timings(t, &cur, 0, false))
+		return -EINVAL;
+	*t = cur;
+	return 0;
+}
+
+static int fp_enum_dv_timings(struct file *file, void *priv, struct v4l2_enum_dv_timings *et)
+{
+	if (et->pad || et->index)
+		return -EINVAL;
+	memset(et->reserved, 0, sizeof(et->reserved));
+	return fp_port_timings(video_drvdata(file), &et->timings) ? -EINVAL : 0;
+}
+
+static int fp_dv_timings_cap(struct file *file, void *priv, struct v4l2_dv_timings_cap *cap)
+{
+	if (cap->pad)
+		return -EINVAL;
+	*cap = fp_dv_cap;
+	return 0;
 }
 
 static int fp_subscribe_event(struct v4l2_fh *fh, const struct v4l2_event_subscription *sub)
@@ -974,6 +1074,11 @@ static const struct v4l2_ioctl_ops fp_ioctl_ops = {
 	.vidioc_enum_input            = fp_enum_input,
 	.vidioc_g_input               = fp_g_input,
 	.vidioc_s_input               = fp_s_input,
+	.vidioc_query_dv_timings      = fp_query_dv_timings,
+	.vidioc_g_dv_timings          = fp_g_dv_timings,
+	.vidioc_s_dv_timings          = fp_s_dv_timings,
+	.vidioc_enum_dv_timings       = fp_enum_dv_timings,
+	.vidioc_dv_timings_cap        = fp_dv_timings_cap,
 	.vidioc_reqbufs               = vb2_ioctl_reqbufs,
 	.vidioc_create_bufs           = vb2_ioctl_create_bufs,
 	.vidioc_prepare_buf           = vb2_ioctl_prepare_buf,
