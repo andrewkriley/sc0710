@@ -19,8 +19,35 @@ High-performance, multi-client Linux driver for the Elgato 4K60 Pro MK.2 and Elg
 |------|-------------|-------|
 | **Elgato 4K60 Pro MK.2** | `1cfa:000e` | Plug-and-play after driver load. No FPGA firmware step. |
 | **Elgato 4K Pro** | `1cfa:0012` | Requires **ECP5 FPGA firmware** programming on every **cold boot**. Handled automatically by the installer and the AUR package; manual `insmod` builds need extra steps (see below). |
+| **Elgato Cam Link Pro** (4× HDMI) | `1cfa:0011` | **Experimental.** Four capture nodes, one per HDMI input, all usable at once. Needs the same `SC0710.FWI.HEX` ECP5 firmware location as the 4K Pro (the file shipped with the Cam Link Pro Windows driver). See [Cam Link Pro](#cam-link-pro-4-hdmi-inputs). |
 
-Both cards share the same `12ab:0710` Magewell chipset but use different board profiles in the driver.
+All cards share the same `12ab:0710` chipset but use different board profiles in the driver.
+
+### Cam Link Pro (4 HDMI inputs)
+
+The Cam Link Pro streams all four inputs continuously through a single XDMA
+channel as interleaved, self-describing lines (16-byte header: port, line
+number, plane). The driver demultiplexes that stream in software into one
+V4L2 node per input (`lib/sc0710-4port.c`), so every input can be captured
+at the same time:
+
+```
+/dev/videoN    "Cam Link Pro HDMI 1" .. "HDMI 4"
+4K inputs      NV12 (the card's own choice; no YUYV/BGR24 option)
+1080p inputs   YUYV
+ALSA           card "Cam Link Pro", PCM devices 0-3 = HDMI 1-4,
+               48 kHz stereo S16_LE (e.g. arecord -D hw:CARD=Pro,DEV=2)
+```
+
+The capture session runs while any video node or PCM is open (plus 2 s,
+so device probes don't restart it); audio works without a video client.
+
+The format follows whatever the source sends; a change while streaming
+raises `V4L2_EVENT_SOURCE_CHANGE`. Module parameters: `fourport_ring_chunks`
+(DMA ring size, default 64 × ~1 MiB) and `fourport_status_ms` (input poll
+interval). Not yet supported on this card: HDR/colour metadata, EDID selection, the
+`sc0710-cli` controls. Tested with 3× 2160p30 + 1× 1080p60
+simultaneously at full frame rate.
 
 ## Kernel compatibility
 
@@ -342,6 +369,7 @@ For GitHub issues, attach output from `sc0710-cli --dump`.
 
 ## Known limitations / roadmap
 
+* **Cam Link Pro** — formats other than 2160p30 / 1080p60 untested
 * **4K60 DMA tearing** — horizontal tears or frame shifts at 4K60 (~995 MB/s) under heavy load; **under active investigation**
 * **10-bit planar formats** — P010/P016 not implemented; HDR passthrough uses native **BGR24** 4:4:4 instead
 

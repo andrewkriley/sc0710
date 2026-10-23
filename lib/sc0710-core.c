@@ -842,6 +842,7 @@ static void sc0710_dev_release(struct v4l2_device *v4l2_dev)
 	/* No-op unless the handler was initialized (4K Pro only); freed here
 	 * because open file handles unsubscribe control events through it. */
 	v4l2_ctrl_handler_free(&dev->ctrl_handler);
+	sc0710_4port_release(dev);
 	pci_dev_put(dev->pci);
 	kfree(dev);
 }
@@ -954,6 +955,16 @@ static int sc0710_initdev(struct pci_dev *pci_dev,
 	printk(KERN_INFO "sc0710 device at %s\n", pci_name(pci_dev));
 	printk(KERN_INFO "sc0710 page-size %lu bytes\n", PAGE_SIZE);
 
+	/* The Cam Link Pro streams all four inputs through one DMA channel
+	 * and has its own capture path; none of the single-input channel,
+	 * kthread or devlist machinery below applies to it. */
+	if (dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO) {
+		err = sc0710_4port_probe(dev);
+		if (err < 0)
+			goto fail_dev;
+		return 0;
+	}
+
 	err = sc0710_dma_channels_alloc(dev);
 	if (err < 0) {
 		printk(KERN_ERR "%s: DMA channel allocation failed (%d), aborting probe\n",
@@ -1046,6 +1057,16 @@ static void sc0710_finidev(struct pci_dev *pci_dev)
 {
 	struct sc0710_dev *dev = pci_get_drvdata(pci_dev);
 	int i;
+
+	if (dev->board == SC0710_BOARD_ELGATO_CAMLINK_PRO) {
+		WRITE_ONCE(dev->disconnected, true);
+		sc0710_4port_remove(dev);
+		pci_disable_device(pci_dev);
+		sc0710_dev_unregister(dev);
+		v4l2_device_unregister(&dev->v4l2_dev);
+		v4l2_device_put(&dev->v4l2_dev);
+		return;
+	}
 
 	if (dev->board == SC0710_BOARD_ELGATEO_4KP60_MK2) {
 		device_remove_bin_file(&pci_dev->dev, &bin_attr_hdr_tonemap);

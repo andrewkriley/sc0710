@@ -40,6 +40,11 @@ struct sc0710_board sc0710_boards[] = {
 		.name		= "Elgato 4K Pro",
 		.bar1_index	= 1,
 	},
+
+	[SC0710_BOARD_ELGATO_CAMLINK_PRO] = {
+		.name		= "Elgato Cam Link Pro",
+		.bar1_index	= 1,
+	},
 };
 const unsigned int sc0710_bcount = ARRAY_SIZE(sc0710_boards);
 
@@ -52,6 +57,10 @@ struct sc0710_subid sc0710_subids[] = {
 		.subvendor = 0x1cfa,
 		.subdevice = 0x0012,
 		.card      = SC0710_BOARD_ELGATEO_4KP,
+	}, {
+		.subvendor = 0x1cfa,
+		.subdevice = 0x0011,
+		.card      = SC0710_BOARD_ELGATO_CAMLINK_PRO,
 	}
 };
 const unsigned int sc0710_idcount = ARRAY_SIZE(sc0710_subids);
@@ -462,7 +471,7 @@ static int sc0710_ecp5_firmware_check(struct sc0710_dev *dev)
 {
 	u8 *fw_data;
 	size_t fw_size;
-	u32 idcode, half_size, status;
+	u32 idcode, payload_size, first_size, second_size, status;
 	u8 *decoded;
 	int ret, i;
 
@@ -503,30 +512,38 @@ static int sc0710_ecp5_firmware_check(struct sc0710_dev *dev)
 		return -EINVAL;
 	}
 
-	half_size = (fw_size - FWI_HEADER_SIZE) / 2;
+	payload_size = fw_size - FWI_HEADER_SIZE;
+	first_size = payload_size - payload_size / 2;
+	second_size = payload_size - first_size;
 
 	/* FWI format: 16-byte header + two halves with swapped order.
 	 * Full .bit file = (second half XOR 0xA5) + (first half XOR 0x5A).
 	 * Windows sends all 356,448 bytes including text header.
+	 *
+	 * payload_size isn't guaranteed even: the Cam Link Pro's bitstream
+	 * has a 622,035-byte payload. Its odd byte belongs to the first half;
+	 * that split reproduces the vendor driver's traced SPI burst byte for
+	 * byte, where giving it to the second half put a stray byte ahead of
+	 * the bitstream preamble.
 	 */
-	decoded = vmalloc(half_size * 2);
+	decoded = vmalloc(first_size + second_size);
 	if (!decoded) {
 		vfree(fw_data);
 		return -ENOMEM;
 	}
 
 	/* First part of bitstream: FWI second half XOR 0xA5 */
-	for (i = 0; i < half_size; i++)
-		decoded[i] = fw_data[FWI_HEADER_SIZE + half_size + i] ^ FWI_XOR_SECOND;
+	for (i = 0; i < second_size; i++)
+		decoded[i] = fw_data[FWI_HEADER_SIZE + first_size + i] ^ FWI_XOR_SECOND;
 
 	/* Second part of bitstream: FWI first half XOR 0x5A */
-	for (i = 0; i < half_size; i++)
-		decoded[half_size + i] = fw_data[FWI_HEADER_SIZE + i] ^ FWI_XOR_FIRST;
+	for (i = 0; i < first_size; i++)
+		decoded[second_size + i] = fw_data[FWI_HEADER_SIZE + i] ^ FWI_XOR_FIRST;
 
 	vfree(fw_data);
 
 	for (i = 0; i < 3; i++) {
-		ret = ecp5_program_bitstream(dev, decoded, half_size * 2);
+		ret = ecp5_program_bitstream(dev, decoded, first_size + second_size);
 		if (!ret)
 			break;
 		printk(KERN_WARNING "%s: ECP5 programming attempt %d failed, retrying...\n",
@@ -629,6 +646,31 @@ int sc0710_card_setup(struct sc0710_dev *dev)
 		sc_write(dev, 0, BAR0_00D0, 0x4100);
 		sc_set(dev, 0, BAR0_00D0, 0x0001);    /* pipeline enable */
 		sc_write(dev, 0, 0xEC, 0x00000020);   /* scaler enable */
+		break;
+	case SC0710_BOARD_ELGATO_CAMLINK_PRO:
+		/* Vendor boot order from the VFIO trace: 0xC4, XDMA interrupt
+		 * masks, then the ECP5 bitstream. No AXI IIC timing setup. The
+		 * capture pipeline itself is programmed per session by
+		 * sc0710-4port.c. */
+		sc_write(dev, 0, BAR0_00C4, 0x000f0000);
+		sc_write(dev, 1, BAR1_0094, 0x00fffe3e);
+		sc_write(dev, 1, BAR1_0008, 0x00fffe3e);
+		sc_write(dev, 1, BAR1_0194, 0x00fffe3e);
+		sc_write(dev, 1, BAR1_0108, 0x00fffe3e);
+		sc_write(dev, 1, BAR1_1094, 0x00fffe7e);
+		sc_write(dev, 1, BAR1_1008, 0x00fffe7e);
+		sc_write(dev, 1, BAR1_1194, 0x00fffe7e);
+		sc_write(dev, 1, BAR1_1108, 0x00fffe7e);
+		sc_write(dev, 1, BAR1_2080, 0);
+		sc_write(dev, 1, BAR1_2084, 0);
+		sc_write(dev, 1, BAR1_2088, 0);
+		sc_write(dev, 1, BAR1_208C, 0);
+		sc_write(dev, 1, BAR1_20A0, 0);
+		sc_write(dev, 1, BAR1_20A4, 0);
+
+		ret = sc0710_ecp5_firmware_check(dev);
+		if (ret < 0)
+			return ret;
 		break;
 	}
 

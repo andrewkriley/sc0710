@@ -124,6 +124,7 @@ extern unsigned int keep_audio_alive;
 #define SC0710_BOARD_UNKNOWN             0
 #define SC0710_BOARD_ELGATEO_4KP60_MK2   1
 #define SC0710_BOARD_ELGATEO_4KP         2
+#define SC0710_BOARD_ELGATO_CAMLINK_PRO  3 /* 4x HDMI, see sc0710-4port.c */
 
 enum sc0710_timing_mode {
 	TIMING_MODE_MERGE = 0,           /* Use static match + dynamic fallback */
@@ -500,6 +501,10 @@ struct sc0710_dev {
 	/* Misc structs */
 	struct sc0710_i2c          i2cbus[1];
 
+	/* Cam Link Pro only: the 4-port capture path, which replaces the
+	 * channel/kthread machinery below (sc0710-4port.c). */
+	struct sc0710_4port       *fourport;
+
 	/* Anything channel related. */
 	struct sc0710_dma_channel  channel[SC0710_MAX_CHANNELS];
 
@@ -682,6 +687,12 @@ int sc0710_i2c_read_status2(struct sc0710_dev *dev);
 int sc0710_i2c_read_status3(struct sc0710_dev *dev);
 int sc0710_i2c_read_procamp(struct sc0710_dev *dev);
 int sc0710_i2c_write_mcu(struct sc0710_dev *dev, u8 subaddr, u8 *data, int len);
+int sc0710_i2c_read_mcu(struct sc0710_dev *dev, u8 subaddr, u8 *data, int len);
+
+/* -4port.c */
+int  sc0710_4port_probe(struct sc0710_dev *dev);
+void sc0710_4port_remove(struct sc0710_dev *dev);
+void sc0710_4port_release(struct sc0710_dev *dev);
 int sc0710_4kp_wait_pipeline(struct sc0710_dev *dev);
 int sc0710_set_edid_source(struct sc0710_dev *dev, u32 src);
 void sc0710_reset_dma_frame_sync(struct sc0710_dev *dev);
