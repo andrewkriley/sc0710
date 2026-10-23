@@ -2034,6 +2034,10 @@ static void sc0710_vid_timeout(struct timer_list *t)
 	}
 
 	dprintk(0, "%s(ch#%d) - delivering placeholder frames\n", __func__, ch->nr);
+	if (sc0710_debug_mode)
+		printk(KERN_INFO "%s: DEBUG dma_active(ch#%d): live_fmt=%p dev->locked=%d ch->state=%d(RUNNING=%d) dma_active=%d live=%ux%u\n",
+			dev->name, ch->nr, live_fmt, dev->locked, ch->state, STATE_RUNNING,
+			dma_active, live_w, live_h);
 
 	spin_lock_irqsave(&ch->client_list_lock, flags);
 	list_for_each_entry(client, &ch->client_list, list) {
@@ -2044,6 +2048,13 @@ static void sc0710_vid_timeout(struct timer_list *t)
 			continue;
 
 		any_streaming = 1;
+
+		if (sc0710_debug_mode)
+			printk(KERN_INFO "%s: DEBUG dma_active(ch#%d): client stream=%ux%u vs live=%ux%u -> %s\n",
+				dev->name, ch->nr, client->stream_width, client->stream_height,
+				live_w, live_h,
+				(dma_active && client->stream_width == live_w &&
+				 client->stream_height == live_h) ? "REAL" : "PLACEHOLDER");
 
 		if (dma_active &&
 		    client->stream_width == live_w &&

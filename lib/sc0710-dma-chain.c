@@ -122,7 +122,20 @@ int sc0710_dma_chain_alloc(struct sc0710_dma_channel *ch, int nr, int total_tran
 	struct sc0710_dma_descriptor_chain_allocation *dca = &chain->allocations[0];
 	int rem = total_transfer_size;
 	int size;
-	int segsize = 4 * 1048576;
+	/* Was 4 * 1048576 (2^22), then 1572864 (1.5 MiB) - see STATUS.md PICK UP
+	 * HERE (21) for that earlier history. Settled here at 1920 KiB (STATUS.md
+	 * PICK UP HERE (64)/(68)/(69)): the sc0710_dma_segsize_kb bisection sweep
+	 * ((47)-(64)) never found a deterministic segsize ceiling - every
+	 * single-sample "bad" verdict at nearby sizes was later overturned by a
+	 * multi-run retest, pointing to a real but still-unexplained intermittent
+	 * hardware/timing issue rather than a fixable segsize choice. 1920 KiB and
+	 * 1888 KiB were the two sizes that came out multi-run-clean (130/130
+	 * steady-state frames, only the known segsize-independent warm-up
+	 * artifact in frames 0-3). Three separate Ghidra passes on YUAN's own
+	 * SC0710 driver ((66)-(69)) didn't find a different completion strategy
+	 * or a wrong-firmware explanation either - this value is the practical
+	 * resolution, not a proven-correct one. */
+	int segsize = 1920 * 1024; /* 1920 KiB */
 
 	/* Zero-copy: split video chains finer. More (smaller) descriptors per
 	 * chain keep a rewritten chain's ring slots beyond the device's
@@ -132,6 +145,25 @@ int sc0710_dma_chain_alloc(struct sc0710_dma_channel *ch, int nr, int total_tran
 		u32 split = min_t(u32, zc_split, SC0710_MAX_CHAIN_DESCRIPTORS);
 
 		segsize = ALIGN(DIV_ROUND_UP(total_transfer_size, split), 4096);
+	} else if (sc0710_dma_segsize_kb) {
+		/* TEST (STATUS.md PICK UP HERE 47): bisect the real safe single-DMA-
+		 * burst ceiling directly via a load-time size instead of the two
+		 * extremes ((38)'s whole-transfer single segment vs. the original
+		 * 1.5 MiB) tried so far. */
+		segsize = sc0710_dma_segsize_kb * 1024;
+	} else if (sc0710_single_dma_segment) {
+		/* TEST (STATUS.md PICK UP HERE 38): the vendor driver's own
+		 * per-frame DMA buffer allocation scheme couldn't be confirmed
+		 * from the Windows binary (its AllocateCommonBuffer call goes
+		 * through an untyped DMA_ADAPTER vtable dispatch) - the
+		 * 1.5 MiB chained-segment split above is entirely this port's
+		 * own invention (PICK UP HERE 21), not known to match what
+		 * the hardware actually expects. Force exactly one segment,
+		 * sized to the whole transfer, to test empirically whether
+		 * the persistent segment-boundary tail-zero holes are an
+		 * artifact of chaining multiple descriptors together at all,
+		 * independent of whatever segment size is chosen. */
+		segsize = total_transfer_size;
 	}
 
 	chain->enabled = 1;

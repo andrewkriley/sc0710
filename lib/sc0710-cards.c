@@ -462,7 +462,7 @@ static int sc0710_ecp5_firmware_check(struct sc0710_dev *dev)
 {
 	u8 *fw_data;
 	size_t fw_size;
-	u32 idcode, half_size, status;
+	u32 idcode, payload_size, first_size, second_size, status;
 	u8 *decoded;
 	int ret, i;
 
@@ -503,30 +503,39 @@ static int sc0710_ecp5_firmware_check(struct sc0710_dev *dev)
 		return -EINVAL;
 	}
 
-	half_size = (fw_size - FWI_HEADER_SIZE) / 2;
+	payload_size = fw_size - FWI_HEADER_SIZE;
+	first_size = payload_size / 2;
+	second_size = payload_size - first_size;
 
 	/* FWI format: 16-byte header + two halves with swapped order.
 	 * Full .bit file = (second half XOR 0xA5) + (first half XOR 0x5A).
 	 * Windows sends all 356,448 bytes including text header.
+	 *
+	 * payload_size isn't guaranteed even (e.g. a 4-port board's larger
+	 * bitstream measured 622,035 bytes payload) — floor/floor on both
+	 * halves silently dropped the file's last byte and broke the ECP5's
+	 * own bitstream CRC check. second_size gets the extra byte instead,
+	 * since it's the file's tail segment; first_size (and its offset)
+	 * is unchanged from the original even-payload math.
 	 */
-	decoded = vmalloc(half_size * 2);
+	decoded = vmalloc(first_size + second_size);
 	if (!decoded) {
 		vfree(fw_data);
 		return -ENOMEM;
 	}
 
 	/* First part of bitstream: FWI second half XOR 0xA5 */
-	for (i = 0; i < half_size; i++)
-		decoded[i] = fw_data[FWI_HEADER_SIZE + half_size + i] ^ FWI_XOR_SECOND;
+	for (i = 0; i < second_size; i++)
+		decoded[i] = fw_data[FWI_HEADER_SIZE + first_size + i] ^ FWI_XOR_SECOND;
 
 	/* Second part of bitstream: FWI first half XOR 0x5A */
-	for (i = 0; i < half_size; i++)
-		decoded[half_size + i] = fw_data[FWI_HEADER_SIZE + i] ^ FWI_XOR_FIRST;
+	for (i = 0; i < first_size; i++)
+		decoded[second_size + i] = fw_data[FWI_HEADER_SIZE + i] ^ FWI_XOR_FIRST;
 
 	vfree(fw_data);
 
 	for (i = 0; i < 3; i++) {
-		ret = ecp5_program_bitstream(dev, decoded, half_size * 2);
+		ret = ecp5_program_bitstream(dev, decoded, first_size + second_size);
 		if (!ret)
 			break;
 		printk(KERN_WARNING "%s: ECP5 programming attempt %d failed, retrying...\n",
@@ -628,7 +637,13 @@ int sc0710_card_setup(struct sc0710_dev *dev)
 		sc_write(dev, 0, BAR0_00D0, 0x4300);  /* reset */
 		sc_write(dev, 0, BAR0_00D0, 0x4100);
 		sc_set(dev, 0, BAR0_00D0, 0x0001);    /* pipeline enable */
-		sc_write(dev, 0, 0xEC, 0x00000020);   /* scaler enable */
+		/* 0xEC is the port-enable/mode register (see the read-modify-write
+		 * in sc0710_program_pipeline_regs(), the authoritative place for
+		 * it) -- 0x20 here was a stale guess (misread as "scaler enable")
+		 * that actually set port 1's enable bit, not port 0's. No port is
+		 * really streaming yet at probe time, so leave it clear; the
+		 * pipeline-regs path sets the correct bit once a channel starts. */
+		sc_write(dev, 0, 0xEC, 0x00000000);
 		break;
 	}
 

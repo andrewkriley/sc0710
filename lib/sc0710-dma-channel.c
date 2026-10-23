@@ -292,7 +292,8 @@ static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch,
 	u32 cached_framesize,
 	u32 cached_width,
 	u32 cached_height,
-	u32 cached_interlaced)
+	u32 cached_interlaced,
+	unsigned int chain_idx)
 {
 	struct sc0710_dev *dev = ch->dev;
 	struct sc0710_client *client;
@@ -534,6 +535,30 @@ static void sc0710_dma_dequeue_video(struct sc0710_dma_channel *ch,
 				len = sc0710_dma_chain_dq_to_ptr(ch, chain, dst, source_framesize);
 				vb2_set_plane_payload(&vb_buf->vb.vb2_buf, 0, source_framesize);
 			}
+		}
+
+		/* DEBUG (see STATUS.md dequeue_video-tracing): this is the plain
+		 * copy-from-hardware-DMA-memory path that deliver_targeted's
+		 * chain-index tracing never actually reaches (it only fires when
+		 * chain->target_buf is set). Log which chain fed this frame plus
+		 * a cheap content signature of what actually landed in dst, to
+		 * tell apart "real but malformed DMA payload" from "wbm signaled
+		 * done but the payload bytes were never written." */
+		if (sc0710_debug_mode) {
+			u32 sig = 0;
+			int sig_len = min_t(int, (int)buffer_size, 4096);
+			int k;
+
+			for (k = 0; k < sig_len; k++)
+				sig += dst[k];
+
+			printk(KERN_INFO "%s: DEBUG dequeue_video ch#%d chain#%u seq=%u "
+				"path=%s bytes=%u first8=%02x%02x%02x%02x%02x%02x%02x%02x sig4k=%08x\n",
+				dev->name, ch->nr, chain_idx, ch->frame_sequence,
+				src_frame ? "copy-src" : "dma-chain",
+				(unsigned int)buffer_size,
+				dst[0], dst[1], dst[2], dst[3], dst[4], dst[5], dst[6], dst[7],
+				sig);
 		}
 
 		vb_buf->vb.vb2_buf.timestamp = ktime_get_ns();
@@ -810,7 +835,7 @@ static void sc0710_dma_chain_try_target(struct sc0710_dma_channel *ch, int chain
 
 /* Deliver a frame the hardware already placed in the targeted buffer. */
 static void sc0710_dma_deliver_targeted(struct sc0710_dma_channel *ch,
-	struct sc0710_dma_descriptor_chain *chain)
+	struct sc0710_dma_descriptor_chain *chain, unsigned int chain_idx)
 {
 	struct sc0710_buffer *buf = chain->target_buf;
 
@@ -824,6 +849,12 @@ static void sc0710_dma_deliver_targeted(struct sc0710_dma_channel *ch,
 	buf->vb.vb2_buf.timestamp = ktime_get_ns();
 	buf->vb.sequence = ch->frame_sequence++;
 	buf->vb.field = V4L2_FIELD_NONE;
+
+	if (sc0710_debug_mode)
+		printk(KERN_INFO "%s: DEBUG deliver_targeted ch#%d chain#%u seq=%u bytes=%u\n",
+			ch->dev->name, ch->nr, chain_idx, buf->vb.sequence,
+			chain->total_transfer_size);
+
 	vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_DONE);
 
 	ch->zc_frames_direct++;
@@ -919,12 +950,14 @@ int sc0710_dma_channel_service(struct sc0710_dma_channel *ch)
 	u32 cached_framesize;
 	u32 cached_width, cached_height;
 	u32 cached_interlaced;
+	struct sc0710_dma_descriptor_chain_allocation *seg;
 	u32 wbm[2];
 	u32 v;
 	bool sentinel;
 	bool stale_completion;
+	bool all_segments_done;
 	int consumed = 0;
-	int i;
+	int i, j;
 
 	mutex_lock(&ch->lock);
 
@@ -947,6 +980,25 @@ int sc0710_dma_channel_service(struct sc0710_dma_channel *ch)
 	cached_width = cached_fmt ? cached_fmt->width : 0;
 	cached_height = cached_fmt ? cached_fmt->height : 0;
 	cached_interlaced = cached_fmt ? cached_fmt->interlaced : 0;
+
+	/* TEMP DEBUG (see STATUS.md PICK UP HERE 34): BAR0+0xD8 shares its
+	 * base pointer with the confirmed BAR0+0xEC channel-enable register
+	 * (PICK UP HERE 4/5) - Ghidra shows the vendor's own completion-poll
+	 * kthread (FUN_140267e40) reads this register's upper 16 bits as an
+	 * escalating stall/backpressure indicator (thresholds 0x3ff/0x7ff/
+	 * 0xbff -> severity 1/2/3) specifically in the branch that fires when
+	 * its hwcount hasn't advanced since the last poll - i.e. exactly the
+	 * condition this function's early-return below skips over without
+	 * logging anything. Read and log it unconditionally, before that
+	 * early return, so a genuine stall (like test21's zero-completions
+	 * ch#0 run) is actually visible instead of producing silence. */
+	if (sc0710_debug_mode) {
+		u32 d8 = sc_read(ch->dev, 0, 0xD8);
+		u32 level = (d8 >> 16) > 0xbff ? 3 : (d8 >> 16) > 0x7ff ? 2 : (d8 >> 16) > 0x3ff ? 1 : 0;
+
+		printk(KERN_INFO "sc0710: DEBUG bar0_0xd8 ch#%d raw=%08x upper16=%u level=%u\n",
+			ch->nr, d8, d8 >> 16, level);
+	}
 
 	/* Read how many descriptors have complete, if this hasn't changed
 	 * single we last checked, end early, nothing for us to do.
@@ -988,6 +1040,21 @@ int sc0710_dma_channel_service(struct sc0710_dma_channel *ch)
 		wbm[0] = *dca->wbm[0];
 		wbm[1] = *dca->wbm[1];
 
+		/* TEMP DEBUG (see STATUS.md PICK UP HERE 23/24): confirm
+		 * whether the writeback sentinel words are ever actually
+		 * stamped non-zero for this channel, independent of the raw
+		 * completed-descriptor-count register already known to climb.
+		 * Also log that raw HW counter (v) and numAllocations here so
+		 * a per-lap delta in v can be compared against how many
+		 * descriptors this chain actually expects - the wbm words are
+		 * software-visible sentinel bits that this project's last two
+		 * fix attempts haven't been able to make reliable, whereas v
+		 * is a real hardware completion counter untouched by any of
+		 * that bookkeeping. */
+		if (sc0710_debug_mode)
+			printk(KERN_INFO "sc0710: DEBUG wbm ch#%d chain#%d wbm0=%08x wbm1=%08x hwcount=%u numAllocations=%u\n",
+				ch->nr, i, wbm[0], wbm[1], v, chain->numAllocations);
+
 		/* With the sentinel armed, a lap whose last descriptor was
 		 * consumed stale completes into the retired slot half. */
 		stale_completion = false;
@@ -999,10 +1066,79 @@ int sc0710_dma_channel_service(struct sc0710_dma_channel *ch)
 			stale_completion = wbm[0] && wbm[1];
 		}
 
+		/* The last allocation's writeback firing only proves that segment's
+		 * own DMA write landed - each earlier segment has its own independent
+		 * writeback metadata, and the hardware doesn't guarantee those land
+		 * before the last one's does. Require every segment's own writeback
+		 * before treating the whole chain as complete (STATUS.md PICK UP HERE
+		 * 22): a still-in-flight earlier segment just means we pick this chain
+		 * back up on a later poll, same as when the last segment isn't done
+		 * yet.
+		 */
+		all_segments_done = true;
+		if (wbm[0] && wbm[1]) {
+			for (j = 0; j < (int)chain->numAllocations - 1; j++) {
+				seg = &chain->allocations[j];
+
+				rmb();
+				if (!(*seg->wbm[0] && *seg->wbm[1])) {
+					all_segments_done = false;
+					break;
+				}
+			}
+		}
+
 		/* If the write back metadata is set, we know the chain is complete, we'll
 		 * need to process a complete video/audio transfer.
 		 */
-		if (wbm[0] && wbm[1]) {
+		if (wbm[0] && wbm[1] && all_segments_done) {
+			/* TEMP DEBUG (see STATUS.md PICK UP HERE 29/30): a single
+			 * 50us before/after checksum window (PICK UP HERE 26)
+			 * found zero evidence of a write-posting race, and a
+			 * fresh Ghidra pass over the vendor binary (PICK UP HERE
+			 * 29) confirmed the vendor's own completion thread trusts
+			 * the exact same hwcount signal Linux already reads, with
+			 * no richer per-descriptor status available at all - so
+			 * this isn't a missing software check. The one variable
+			 * not yet ruled out is a *slower* race: 50us may simply
+			 * have been too short a window. Directly poll each
+			 * segment whose tail word reads zero right as wbm claims
+			 * the chain done, every 50us for up to 5ms, and log
+			 * whether it ever flips non-zero.
+			 */
+			if (sc0710_debug_mode) {
+				int k;
+
+				for (k = 0; k < (int)chain->numAllocations; k++) {
+					struct sc0710_dma_descriptor_chain_allocation *sdca = &chain->allocations[k];
+					u8 *tail = (u8 *)sdca->buf_cpu + sdca->buf_size - sizeof(u32);
+					u32 val = *(volatile u32 *)tail;
+					int retry;
+					u32 flush = 0;
+
+					if (val != 0)
+						continue;
+
+					for (retry = 0; retry < 100; retry++) {
+						udelay(50);
+						flush = sc_read(ch->dev, 1, ch->reg_dma_completed_descriptor_count);
+						rmb();
+						val = *(volatile u32 *)tail;
+						if (val != 0)
+							break;
+					}
+
+					if (val != 0)
+						printk(KERN_INFO "sc0710: DEBUG payload-race-retry ch#%d chain#%d seg#%d "
+							"RESOLVED after %d retries (%dus) tail=%08x hwcount_flush=%u\n",
+							ch->nr, i, k, retry + 1, (retry + 1) * 50, val, flush);
+					else
+						printk(KERN_INFO "sc0710: DEBUG payload-race-retry ch#%d chain#%d seg#%d "
+							"NEVER resolved after %d retries (%dus), tail still zero, hwcount_flush=%u\n",
+							ch->nr, i, k, retry, retry * 50, flush);
+				}
+			}
+
 			if (sentinel && sc0710_dma_chain_stale_scan(ch, chain) &&
 			    !ch->zc_stale_trip) {
 				/* The device consumed a pre-rewrite descriptor:
@@ -1058,14 +1194,14 @@ int sc0710_dma_channel_service(struct sc0710_dma_channel *ch)
 						sc0710_dma_chain_untarget(chain);
 						sc0710_dma_dequeue_video(ch, chain,
 							cached_framesize, cached_width,
-							cached_height, cached_interlaced);
+							cached_height, cached_interlaced, i);
 					} else {
-						sc0710_dma_deliver_targeted(ch, chain);
+						sc0710_dma_deliver_targeted(ch, chain, i);
 					}
 				} else {
 					sc0710_dma_dequeue_video(ch, chain, cached_framesize,
 						cached_width, cached_height,
-						cached_interlaced);
+						cached_interlaced, i);
 				}
 			} else
 			if (ch->mediatype == CHTYPE_AUDIO) {
@@ -1075,6 +1211,21 @@ int sc0710_dma_channel_service(struct sc0710_dma_channel *ch)
 			/* Reset the descriptor state so we know when it's complete next time. */
 			*(dca->wbm[0]) = 0;
 			*(dca->wbm[1]) = 0;
+
+			/* Outside the zero-copy sentinel scheme, sc0710_dma_chain_flip_wbm()
+			 * below never runs, so it's the only thing that ever clears an
+			 * earlier segment's writeback (STATUS.md PICK UP HERE 23) - without
+			 * this, all_segments_done reads each earlier segment's stale, never-
+			 * cleared writeback from lap 1 forever after, defeating the gate
+			 * added in PICK UP HERE 22 from the second lap onward. */
+			if (!(sentinel && !ch->zc_stale_trip)) {
+				for (j = 0; j < (int)chain->numAllocations - 1; j++) {
+					seg = &chain->allocations[j];
+
+					*(seg->wbm[0]) = 0;
+					*(seg->wbm[1]) = 0;
+				}
+			}
 
 			/* Write memory barrier to ensure metadata clear is visible
 			 * before any subsequent operations.

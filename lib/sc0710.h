@@ -94,6 +94,15 @@ extern unsigned int zero_copy;
  * descriptors per video chain; 0 = keep the default 4 MiB segmenting. */
 extern unsigned int zc_split;
 
+/* TEST (STATUS.md PICK UP HERE 38): force one dma_alloc_coherent segment per
+ * non-zero-copy chain instead of the default ~1.5 MiB chained segments. */
+extern unsigned int sc0710_single_dma_segment;
+
+/* TEST (STATUS.md PICK UP HERE 47): override the non-zero-copy DMA chain
+ * segment size directly, in KiB. 0 = default 1.5 MiB. Takes priority over
+ * sc0710_single_dma_segment when both are set. */
+extern unsigned int sc0710_dma_segsize_kb;
+
 /* Keep the ALSA capture session alive independently of V4L2 (keep_audio_alive=
  * module param, runtime writable). 0 (default) couples audio DMA to video
  * streaming as before; 1 lets an ALSA client hold the audio session open on

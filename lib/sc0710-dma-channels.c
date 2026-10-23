@@ -33,6 +33,15 @@ int sc0710_dma_channels_resize(struct sc0710_dev *dev)
 	switch (dev->board) {
 	case SC0710_BOARD_ELGATEO_4KP60_MK2:
 	case SC0710_BOARD_ELGATEO_4KP:
+		/* REVERTED 2026-08-30 (see STATUS.md PICK UP HERE (14)): the
+		 * video/audio base swap tried here was never actually tested
+		 * on hardware (reload silently failed, confirmed via
+		 * srcversion mismatch) -- and a later warm-restart test
+		 * against the ORIGINAL un-swapped 0x1000/0x1100 bases got
+		 * real wbm data on ch#0 (video, 0x1000) on a second
+		 * stream-start within the same module load. That falsifies
+		 * the "0x1000 never completes" premise the swap was based on.
+		 * Back to the receiver-wired original bases. */
 		ret = sc0710_dma_channel_resize(dev, 0, CHDIR_INPUT, 0x1000, CHTYPE_VIDEO);
 		/* Audio uses fixed buffer size, do not resize as it may be active via ALSA */
 		/* sc0710_dma_channel_resize(dev, 1, CHDIR_INPUT, 0x1100, CHTYPE_AUDIO); */
@@ -49,6 +58,11 @@ int sc0710_dma_channels_alloc(struct sc0710_dev *dev)
 	switch (dev->board) {
 	case SC0710_BOARD_ELGATEO_4KP60_MK2:
 	case SC0710_BOARD_ELGATEO_4KP:
+		/* REVERTED 2026-08-30 -- see comment in
+		 * sc0710_dma_channels_resize() above and STATUS.md
+		 * PICK UP HERE (14). The swap tried in PICK UP HERE (13) was
+		 * never actually tested and is no longer well-supported --
+		 * back to the original, receiver-wired bases. */
 		ret = sc0710_dma_channel_alloc(dev, 0, CHDIR_INPUT, 0x1000, CHTYPE_VIDEO);
 		if (ret == 0)
 			ret = sc0710_dma_channel_alloc(dev, 1, CHDIR_INPUT, 0x1100, CHTYPE_AUDIO);
@@ -69,6 +83,58 @@ void sc0710_dma_channels_free(struct sc0710_dev *dev)
 	}
 }
 
+/* Port real-data-path enable/mode bits, BAR0+0xEC. Confirmed via Ghidra
+ * decompile of the vendor Windows driver (FUN_140265050, the function behind
+ * its "ENABLE CH%02d"/"DISABLE CH%02d" debug log lines -- see STATUS.md's
+ * 2026-08-30 writeup): a single shared register where bit (port_index + 4)
+ * gates whether that port's receiver is actually wired into the DMA path,
+ * and a 2-bit field at (8 + port_index*2) selects a clock/scaler mode keyed
+ * on pixel rate. This driver only ever *captures* from port 0 today (no
+ * real input-switching yet), but STATUS.md PICK UP HERE (28): the user
+ * confirmed the vendor Windows app keeps all 4 ports enabled/streaming
+ * simultaneously at all times (that's how it can flip between live sources
+ * instantly) -- every hardware test so far has instead run the FPGA with
+ * only port 0's bit (0x10) set, a port-enable configuration the vendor
+ * software may never actually exercise. Testing whether that matters to
+ * port 0's own DMA reliability (the long-standing segment-tail hole bug):
+ * enable bit (port_index + 4) for all 4 ports here, still only capturing
+ * port 0. Leaves ports 1-3's clock/scaler mode field (bits 10-15) untouched
+ * -- their real signal format/rate is unknown, and this test only cares
+ * about the real-data-path enable bit, not correct video out of those ports.
+ * The vendor driver's two branches for port 0's own 2-bit field are gated on
+ * width*height*fps vs a ~55.3M threshold; every format observed on this
+ * board (3840x2160p30) is far over it, so the "high" branch (mode = 1) is
+ * hardcoded rather than replicated in full -- revisit if a lower-resolution
+ * mode is ever needed.
+ * Read-modify-write deliberately: the previous code here (and the probe-time
+ * write in sc0710_cards.c) blindly overwrote this register with constants
+ * that don't correspond to port 0's actual bit (0x10) -- plausibly the
+ * reason channel 0 never received real DMA data despite successful
+ * format/timing lock (see the "dormant 0x0000/0x0100 DMA channel" findings
+ * earlier in STATUS.md).
+ */
+static void sc0710_program_channel_enable(struct sc0710_dev *dev, bool enable)
+{
+	u32 before = sc_read(dev, 0, 0xEC);
+	u32 v = before;
+
+	if (enable) {
+		v |= (0xf << 4);
+		v = (v & ~(3 << 8)) | (1 << 8);
+	} else {
+		v &= ~(0xf << 4);
+	}
+
+	sc_write(dev, 0, 0xEC, v);
+
+	if (sc0710_debug_mode) {
+		u32 after = sc_read(dev, 0, 0xEC);
+
+		printk(KERN_INFO "%s: DEBUG 0xEC channel-enable: enable=%d before=%08x wrote=%08x readback=%08x\n",
+			dev->name, enable, before, v, after);
+	}
+}
+
 void sc0710_dma_channels_stop(struct sc0710_dev *dev)
 {
 	int i, ret;
@@ -76,6 +142,9 @@ void sc0710_dma_channels_stop(struct sc0710_dev *dev)
 	printk(KERN_DEBUG "%s()\n", __func__);
 
 	sc_clr(dev, 0, BAR0_00D0, 0x0001);
+
+	if (dev->board == SC0710_BOARD_ELGATEO_4KP)
+		sc0710_program_channel_enable(dev, false);
 
 	for (i = 0; i < SC0710_MAX_CHANNELS; i++) {
 		if (!dev->channel[i].enabled)
@@ -107,8 +176,11 @@ void sc0710_program_pipeline_regs(struct sc0710_dev *dev)
 	sc_write(dev, 0, BAR0_00D0, 0x4300);
 	sc_write(dev, 0, BAR0_00D0, d0);
 
-	if (dev->board == SC0710_BOARD_ELGATEO_4KP)
-		sc_write(dev, 0, 0xEC, 0x00000001);
+	if (dev->board == SC0710_BOARD_ELGATEO_4KP) {
+		bool active = dev->channel[0].enabled || dev->channel[1].enabled;
+
+		sc0710_program_channel_enable(dev, active);
+	}
 }
 
 int sc0710_dma_channels_start(struct sc0710_dev *dev)
@@ -190,6 +262,19 @@ int sc0710_dma_sync_session(struct sc0710_dev *dev)
 	need_video_dma = want_video && READ_ONCE(dev->fmt) != NULL;
 	want_audio = alsa_hold || need_video_dma;
 
+	/* TEMP DEBUG (see STATUS.md PICK UP HERE (14)): a warm-restart
+	 * (second stream-start within one module load) got real DMA
+	 * completions on ch#0/video where the cold-start (first start
+	 * since insmod) got none, with no code difference at all -- trace
+	 * which branch below (cold-start GO-together vs already-up
+	 * add-individual-channel) each start actually takes, to find the
+	 * mechanistic difference instead of guessing from static code. */
+	if (sc0710_debug_mode)
+		printk(KERN_INFO "%s: DEBUG dma_sync_session: any_running=%d need_video_dma=%d "
+			"want_audio=%d alsa_hold=%d vch_state=%d ach_state=%d\n",
+			dev->name, any_running, need_video_dma, want_audio, alsa_hold,
+			vch ? vch->state : -1, ach ? ach->state : -1);
+
 	if (!need_video_dma && !want_audio) {
 		if (any_running)
 			sc0710_dma_channels_stop(dev);
@@ -211,6 +296,9 @@ int sc0710_dma_sync_session(struct sc0710_dev *dev)
 
 	if (!any_running) {
 		/* Cold start: prep only the channels we need, then GO. */
+		if (sc0710_debug_mode)
+			printk(KERN_INFO "%s: DEBUG dma_sync_session: taking COLD-START branch\n",
+				dev->name);
 		if (need_video_dma) {
 			ret = sc0710_dma_channel_start_prep(vch);
 			if (ret < 0)
@@ -239,6 +327,9 @@ int sc0710_dma_sync_session(struct sc0710_dev *dev)
 	}
 
 	/* Session already up: add or drop individual channels. */
+	if (sc0710_debug_mode)
+		printk(KERN_INFO "%s: DEBUG dma_sync_session: taking ALREADY-UP branch\n",
+			dev->name);
 	if (need_video_dma && vch && vch->state != STATE_RUNNING) {
 		ret = sc0710_dma_channel_start_prep(vch);
 		if (ret < 0)

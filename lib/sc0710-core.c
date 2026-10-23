@@ -27,6 +27,7 @@
 #include <linux/idr.h>
 #include <linux/interrupt.h>
 #include <linux/sysfs.h>
+#include <linux/uaccess.h>
 #include "sc0710.h"
 
 /* bin_attribute callbacks became const-qualified in Linux 6.16. */
@@ -172,6 +173,26 @@ MODULE_PARM_DESC(zc_split,
 	"pieces shrink the contiguity a client buffer must provide and make the "
 	"coherent scratch allocations more reliable. 0 = keep the vendor 4 MiB "
 	"segmenting.");
+
+unsigned int sc0710_single_dma_segment;
+module_param(sc0710_single_dma_segment, uint, 0444);
+MODULE_PARM_DESC(sc0710_single_dma_segment,
+	"TEST (STATUS.md PICK UP HERE 38): non-zero-copy chains normally split into "
+	"~1.5 MiB descriptor segments chained together (our own invention, not known "
+	"to match the vendor driver). 1 = force exactly one dma_alloc_coherent "
+	"segment per chain (sized to the whole transfer) instead, to test whether "
+	"the persistent segment-boundary tail-zero holes are an artifact of chaining "
+	"itself. 0 = default segmented behavior.");
+
+unsigned int sc0710_dma_segsize_kb;
+module_param(sc0710_dma_segsize_kb, uint, 0444);
+MODULE_PARM_DESC(sc0710_dma_segsize_kb,
+	"TEST (STATUS.md PICK UP HERE 47): override the non-zero-copy DMA chain segment "
+	"size directly, in KiB (e.g. 3072, 2048, 1024, 512), to bisect the real safe "
+	"single-DMA-burst ceiling this hardware supports - (47) found every chain slot's "
+	"data loss cutoff landing in a ~4-7MB band when segsize was forced to the whole "
+	"~16.5MB transfer via sc0710_single_dma_segment=1. 0 = default 1.5 MiB segments. "
+	"Takes priority over sc0710_single_dma_segment when both are set.");
 
 unsigned int keep_audio_alive;
 module_param(keep_audio_alive, uint, 0644);
@@ -580,6 +601,64 @@ static int sc0710_proc_show(struct seq_file *m, void *v)
 	return 0;
 }
 
+/* Debug-only register poke: "echo <bar> <reg-hex> <val-hex> > /proc/sc0710"
+ * writes; "echo <bar> <reg-hex> > /proc/sc0710" (two tokens only) reads
+ * without writing anything — for probing never-before-touched register
+ * space before committing to a write. Targets the first (only) board in
+ * devlist. Result goes to dmesg rather than back through this fd, matching
+ * how every other debug signal in this driver already surfaces. Root-only
+ * (inherited from the file's S_IRUSR|S_IWUSR mode) since this pokes live
+ * hardware registers with no validation of what the offset does. */
+static ssize_t sc0710_proc_write(struct file *filp, const char __user *ubuf,
+				  size_t count, loff_t *ppos)
+{
+	struct sc0710_dev *dev;
+	char kbuf[64];
+	unsigned int bar, reg, val, oldval, newval;
+	size_t len = min(count, sizeof(kbuf) - 1);
+	int nargs;
+
+	if (copy_from_user(kbuf, ubuf, len))
+		return -EFAULT;
+	kbuf[len] = '\0';
+
+	nargs = sscanf(kbuf, "%x %x %x", &bar, &reg, &val);
+	if (nargs != 2 && nargs != 3) {
+		printk(KERN_WARNING "sc0710: regwrite: parse error, expected \"<bar> <reg-hex>\" (read) or \"<bar> <reg-hex> <val-hex>\" (write)\n");
+		return -EINVAL;
+	}
+	if (bar != 0 && bar != 1) {
+		printk(KERN_WARNING "sc0710: regwrite: bar must be 0 or 1\n");
+		return -EINVAL;
+	}
+
+	mutex_lock(&devlist);
+	if (list_empty(&sc0710_devlist)) {
+		mutex_unlock(&devlist);
+		printk(KERN_WARNING "sc0710: regwrite: no board present\n");
+		return -ENODEV;
+	}
+	dev = list_first_entry(&sc0710_devlist, struct sc0710_dev, devlist);
+
+	if (nargs == 2) {
+		oldval = sc_read(dev, bar, reg);
+		mutex_unlock(&devlist);
+		printk(KERN_INFO "sc0710: regread: BAR%u_%04x = %08x\n",
+		       bar, reg, oldval);
+		return count;
+	}
+
+	oldval = sc_read(dev, bar, reg);
+	sc_write(dev, bar, reg, val);
+	newval = sc_read(dev, bar, reg);
+	mutex_unlock(&devlist);
+
+	printk(KERN_INFO "sc0710: regwrite: BAR%u_%04x: %08x -> wrote %08x -> now %08x\n",
+	       bar, reg, oldval, val, newval);
+
+	return count;
+}
+
 static int sc0710_proc_open(struct inode *inode, struct file *filp)
 {
 	return single_open(filp, sc0710_proc_show, NULL);
@@ -594,6 +673,7 @@ static int sc0710_proc_state_open(struct inode *inode, struct file *filp)
 static struct file_operations sc0710_proc_fops = {
 	.open		= sc0710_proc_open,
 	.read		= seq_read,
+	.write		= sc0710_proc_write,
 	.llseek		= seq_lseek,
 	.release	= single_release,
 };
@@ -608,6 +688,7 @@ static struct file_operations sc0710_proc_state_fops = {
 static struct proc_ops sc0710_proc_fops = {
 	.proc_open		= sc0710_proc_open,
 	.proc_read		= seq_read,
+	.proc_write		= sc0710_proc_write,
 	.proc_lseek		= seq_lseek,
 	.proc_release	= single_release,
 };
@@ -624,9 +705,10 @@ static int sc0710_proc_create(void)
 {
 	struct proc_dir_entry *pe;
 
-	/* Root-only: the raw register dump has no business being world-readable.
+	/* Root-only: the raw register dump has no business being world-readable,
+	 * and the write side (regwrite debug poke) is even more sensitive.
 	 * sc0710-cli only reads sc0710-state, which stays 0444. */
-	pe = proc_create("sc0710", S_IRUSR, NULL, &sc0710_proc_fops);
+	pe = proc_create("sc0710", S_IRUSR | S_IWUSR, NULL, &sc0710_proc_fops);
 	if (!pe)
 		return -ENOMEM;
 
