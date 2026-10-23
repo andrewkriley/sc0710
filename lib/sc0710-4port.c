@@ -60,6 +60,14 @@ module_param(fourport_ring_chunks, uint, 0444);
 MODULE_PARM_DESC(fourport_ring_chunks,
 	"Cam Link Pro: video ring size in ~1 MiB descriptors (default 64, ~45 ms at full load)");
 
+static unsigned int fourport_debug;
+module_param(fourport_debug, uint, 0644);
+MODULE_PARM_DESC(fourport_debug, "Cam Link Pro: log stream resyncs with context (1 = on)");
+
+/* Grace period before an idle session is stopped, so probes that open and
+ * close the nodes (udev, PipeWire) don't restart the hardware each time. */
+#define FP_IDLE_STOP_MS 2000
+
 static unsigned int fourport_status_ms = 250;
 module_param(fourport_status_ms, uint, 0644);
 MODULE_PARM_DESC(fourport_status_ms, "Cam Link Pro: input status poll interval in ms");
@@ -122,6 +130,7 @@ struct sc0710_4port {
 
 	/* Hardware session, running while any node is open */
 	struct mutex  hw_lock;
+	struct delayed_work stop_work;
 	u32           users;
 	bool          running;
 	bool          disconnected;
@@ -136,7 +145,11 @@ struct sc0710_4port {
 	u8                  carry[FP_LINE];
 	u32                 carry_len;
 	bool                synced;
+	bool                locked_once;	/* first sync of the session seen */
 	u64                 overruns, resyncs;
+	/* Last line accepted, for resync diagnostics */
+	u8                  last_hdr[FP_HDR];
+	u32                 chunk_idx;
 };
 
 static const u8 fp_sync[12] = {
@@ -345,14 +358,17 @@ static void fp_feed(struct sc0710_4port *fp, const u8 *buf, size_t len)
 		memcpy(fp->carry + fp->carry_len, buf, need);
 		fp->carry_len = 0;
 		pos = need;
-		if (!memcmp(fp->carry, fp_sync, sizeof(fp_sync)))
+		if (!memcmp(fp->carry, fp_sync, sizeof(fp_sync))) {
 			fp_line(fp, fp->carry, fp->carry + FP_HDR);
-		else
+			memcpy(fp->last_hdr, fp->carry, FP_HDR);
+		} else
 			fp->synced = false;
 	}
 
 	while (pos + FP_LINE <= len) {
 		if (!fp->synced || memcmp(buf + pos, fp_sync, sizeof(fp_sync))) {
+			size_t start = pos;
+
 			s = fp_find_sync(buf, len, pos + (fp->synced ? 1 : 0));
 			fp->synced = false;
 			if (s < 0) {
@@ -362,10 +378,21 @@ static void fp_feed(struct sc0710_4port *fp, const u8 *buf, size_t len)
 			}
 			pos = s;
 			fp->synced = true;
+			/* The stream doesn't start on a line boundary (the first
+			 * header lands at 3848), so the first lock isn't a resync. */
+			if (!fp->locked_once) {
+				fp->locked_once = true;
+				continue;
+			}
 			fp->resyncs++;
+			if (fourport_debug)
+				printk_ratelimited(KERN_INFO "%s: resync in chunk %u at %zu (+%zu): last hdr %*phN, found %*phN\n",
+					fp->dev->name, fp->chunk_idx, (size_t)s, (size_t)s - start,
+					4, fp->last_hdr + 12, 16, buf + s);
 			continue;
 		}
 		fp_line(fp, buf + pos, buf + pos + FP_HDR);
+		memcpy(fp->last_hdr, buf + pos, FP_HDR);
 		pos += FP_LINE;
 	}
 
@@ -424,6 +451,7 @@ static void fp_service(struct sc0710_4port *fp)
 	while (fp->done_seen != done) {
 		u32 i = fp->done_seen % fp->nchunks;
 
+		fp->chunk_idx = i;
 		fp_feed(fp, fp->chunk_cpu[i], FP_CHUNK);
 		fp->done_seen++;
 	}
@@ -546,6 +574,9 @@ static void fp_hw_start(struct sc0710_4port *fp)
 	fp->done_seen = 0;
 	fp->carry_len = 0;
 	fp->synced = false;
+	fp->locked_once = false;
+	fp->overruns = 0;
+	fp->resyncs = 0;
 	mutex_unlock(&fp->dma_lock);
 
 	sc_write(dev, 1, FP_C2H_CTRL_W1S(0), 1);
@@ -558,7 +589,7 @@ static void fp_hw_start(struct sc0710_4port *fp)
 
 	WRITE_ONCE(fp->running, true);
 	wake_up(&fp->wq);
-	printk(KERN_INFO "%s: capture session started\n", dev->name);
+	printk(KERN_DEBUG "%s: capture session started\n", dev->name);
 }
 
 static void fp_hw_stop(struct sc0710_4port *fp)
@@ -573,21 +604,26 @@ static void fp_hw_stop(struct sc0710_4port *fp)
 	sc_clr(dev, 0, BAR0_00D0, 0x0001);
 	sc_write(dev, 1, FP_C2H_CTRL_W1C(0), 1);
 	sc_write(dev, 1, FP_C2H_CTRL_W1C(1), 1);
-	printk(KERN_INFO "%s: capture session stopped (overruns %llu, resyncs %llu)\n",
+	printk(KERN_DEBUG "%s: capture session stopped (overruns %llu, resyncs %llu)\n",
 		dev->name, fp->overruns, fp->resyncs);
 }
 
 /* The stream runs while any node is open, so formats are known (from the
- * line types) before a client negotiates. */
+ * line types) before a client negotiates, and for FP_IDLE_STOP_MS after
+ * the last close. */
 static int fp_hw_get(struct sc0710_4port *fp)
 {
 	int ret = 0;
 
 	mutex_lock(&fp->hw_lock);
-	if (fp->disconnected)
+	if (fp->disconnected) {
 		ret = -ENODEV;
-	else if (fp->users++ == 0)
-		fp_hw_start(fp);
+	} else {
+		fp->users++;
+		cancel_delayed_work(&fp->stop_work);
+		if (!fp->running)
+			fp_hw_start(fp);
+	}
 	mutex_unlock(&fp->hw_lock);
 	return ret;
 }
@@ -596,6 +632,17 @@ static void fp_hw_put(struct sc0710_4port *fp)
 {
 	mutex_lock(&fp->hw_lock);
 	if (--fp->users == 0 && !fp->disconnected)
+		schedule_delayed_work(&fp->stop_work, msecs_to_jiffies(FP_IDLE_STOP_MS));
+	mutex_unlock(&fp->hw_lock);
+}
+
+/* A get that raced the timer and lost the cancel finds users > 0 here. */
+static void fp_stop_work(struct work_struct *work)
+{
+	struct sc0710_4port *fp = container_of(to_delayed_work(work), struct sc0710_4port, stop_work);
+
+	mutex_lock(&fp->hw_lock);
+	if (!fp->users && fp->running && !fp->disconnected)
 		fp_hw_stop(fp);
 	mutex_unlock(&fp->hw_lock);
 }
@@ -1021,6 +1068,7 @@ int sc0710_4port_probe(struct sc0710_dev *dev)
 	fp->dev = dev;
 	dev->fourport = fp;
 	mutex_init(&fp->hw_lock);
+	INIT_DELAYED_WORK(&fp->stop_work, fp_stop_work);
 	mutex_init(&fp->dma_lock);
 	init_waitqueue_head(&fp->wq);
 
@@ -1078,10 +1126,11 @@ void sc0710_4port_remove(struct sc0710_dev *dev)
 	/* Stop the engines before freeing anything they write to; handles
 	 * that are still open only drop their user count from here on. */
 	mutex_lock(&fp->hw_lock);
-	if (fp->users)
-		fp_hw_stop(fp);
 	fp->disconnected = true;
+	if (fp->running)
+		fp_hw_stop(fp);
 	mutex_unlock(&fp->hw_lock);
+	cancel_delayed_work_sync(&fp->stop_work);
 
 	if (fp->dma_thread)
 		kthread_stop(fp->dma_thread);
