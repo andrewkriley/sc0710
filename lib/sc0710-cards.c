@@ -40,6 +40,11 @@ struct sc0710_board sc0710_boards[] = {
 		.name		= "Elgato 4K Pro",
 		.bar1_index	= 1,
 	},
+
+	[SC0710_BOARD_ELGATO_CAMLINK_PRO] = {
+		.name		= "Elgato Cam Link Pro",
+		.bar1_index	= 1,
+	},
 };
 const unsigned int sc0710_bcount = ARRAY_SIZE(sc0710_boards);
 
@@ -52,6 +57,10 @@ struct sc0710_subid sc0710_subids[] = {
 		.subvendor = 0x1cfa,
 		.subdevice = 0x0012,
 		.card      = SC0710_BOARD_ELGATEO_4KP,
+	}, {
+		.subvendor = 0x1cfa,
+		.subdevice = 0x0011,
+		.card      = SC0710_BOARD_ELGATO_CAMLINK_PRO,
 	}
 };
 const unsigned int sc0710_idcount = ARRAY_SIZE(sc0710_subids);
@@ -504,19 +513,18 @@ static int sc0710_ecp5_firmware_check(struct sc0710_dev *dev)
 	}
 
 	payload_size = fw_size - FWI_HEADER_SIZE;
-	first_size = payload_size / 2;
+	first_size = payload_size - payload_size / 2;
 	second_size = payload_size - first_size;
 
 	/* FWI format: 16-byte header + two halves with swapped order.
 	 * Full .bit file = (second half XOR 0xA5) + (first half XOR 0x5A).
 	 * Windows sends all 356,448 bytes including text header.
 	 *
-	 * payload_size isn't guaranteed even (e.g. a 4-port board's larger
-	 * bitstream measured 622,035 bytes payload) — floor/floor on both
-	 * halves silently dropped the file's last byte and broke the ECP5's
-	 * own bitstream CRC check. second_size gets the extra byte instead,
-	 * since it's the file's tail segment; first_size (and its offset)
-	 * is unchanged from the original even-payload math.
+	 * payload_size isn't guaranteed even: the Cam Link Pro's bitstream
+	 * has a 622,035-byte payload. Its odd byte belongs to the first half;
+	 * that split reproduces the vendor driver's traced SPI burst byte for
+	 * byte (vm/TRACE_NOTES.md), where giving it to the second half put a
+	 * stray byte ahead of the bitstream preamble.
 	 */
 	decoded = vmalloc(first_size + second_size);
 	if (!decoded) {
@@ -644,6 +652,31 @@ int sc0710_card_setup(struct sc0710_dev *dev)
 		 * really streaming yet at probe time, so leave it clear; the
 		 * pipeline-regs path sets the correct bit once a channel starts. */
 		sc_write(dev, 0, 0xEC, 0x00000000);
+		break;
+	case SC0710_BOARD_ELGATO_CAMLINK_PRO:
+		/* Vendor boot order from the VFIO trace: 0xC4, XDMA interrupt
+		 * masks, then the ECP5 bitstream. No AXI IIC timing setup. The
+		 * capture pipeline itself is programmed per session by
+		 * sc0710-4port.c. */
+		sc_write(dev, 0, BAR0_00C4, 0x000f0000);
+		sc_write(dev, 1, BAR1_0094, 0x00fffe3e);
+		sc_write(dev, 1, BAR1_0008, 0x00fffe3e);
+		sc_write(dev, 1, BAR1_0194, 0x00fffe3e);
+		sc_write(dev, 1, BAR1_0108, 0x00fffe3e);
+		sc_write(dev, 1, BAR1_1094, 0x00fffe7e);
+		sc_write(dev, 1, BAR1_1008, 0x00fffe7e);
+		sc_write(dev, 1, BAR1_1194, 0x00fffe7e);
+		sc_write(dev, 1, BAR1_1108, 0x00fffe7e);
+		sc_write(dev, 1, BAR1_2080, 0);
+		sc_write(dev, 1, BAR1_2084, 0);
+		sc_write(dev, 1, BAR1_2088, 0);
+		sc_write(dev, 1, BAR1_208C, 0);
+		sc_write(dev, 1, BAR1_20A0, 0);
+		sc_write(dev, 1, BAR1_20A4, 0);
+
+		ret = sc0710_ecp5_firmware_check(dev);
+		if (ret < 0)
+			return ret;
 		break;
 	}
 
