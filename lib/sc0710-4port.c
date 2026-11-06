@@ -1220,7 +1220,12 @@ static int fp_pcm_open(struct snd_pcm_substream *sub)
 	 * video node does through the v4l2 core. */
 	v4l2_device_get(&p->fp->dev->v4l2_dev);
 	sub->runtime->hw = fp_pcm_hw;
-	return snd_pcm_hw_constraint_integer(sub->runtime, SNDRV_PCM_HW_PARAM_PERIODS);
+	ret = snd_pcm_hw_constraint_integer(sub->runtime, SNDRV_PCM_HW_PARAM_PERIODS);
+	if (ret < 0) {
+		fp_hw_put(p->fp);
+		v4l2_device_put(&p->fp->dev->v4l2_dev);
+	}
+	return ret;
 }
 
 static int fp_pcm_close(struct snd_pcm_substream *sub)
