@@ -1,0 +1,22 @@
+name: Hardware-independent regression checks
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  parser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test the kernel parser with sanitizers
+        run: python3 -B -m unittest discover -s tests -v
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install distribution kernel headers
+        run: sudo apt-get update && sudo apt-get install -y linux-headers-generic
+      - name: Build against distribution kernel
+        run: |
+          headers=$(find /lib/modules -mindepth 2 -maxdepth 2 -name build | sort -V | tail -n 1)
+          test -n "$headers"
+          make KVERSION="$(basename "$(dirname "$headers")")"
